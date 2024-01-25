@@ -83,11 +83,11 @@ class SpeechClassificationModel(LightningModule):
 
         #del self.hparams.label2id
         #print("Model label2id:" , self.hparams.label2id)
-
+        self.__build_model()
 
     def setup(self, stage: str):
         # build model
-        self.__build_model()
+        
 
         if self.hparams.load_pretrained_model is not None:
             logging.info(f"Loading pretrained model from {self.hparams.load_pretrained_model}")
