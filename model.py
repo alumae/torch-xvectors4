@@ -170,7 +170,7 @@ class SpeechClassificationModel(LightningModule):
             freeze_non_lora(self.w2vbert2_model, unfreeze_bias="none")
 
             wavs = torch.randn((1,16000), dtype=torch.float)
-            reps = self.compute_w2vbert_output(wavs)
+            reps = self.compute_w2vbert_output(wavs, wav_lens=torch.tensor([1.0]))
             self.encoder_output_dim = reps.shape[2]
 
         else:
@@ -224,11 +224,27 @@ class SpeechClassificationModel(LightningModule):
         self.train_acc = Accuracy(task='multiclass', num_classes=len(self.hparams.label2id), top_k=1)
         self.valid_acc = Accuracy(task='multiclass', num_classes=len(self.hparams.label2id), top_k=1)
         
+    
+
+    def to(self, device):
+        r = super().to(device)
+        if self.hparams.w2vbert2_model != None:
+            self.w2vbert2_fbank_converter = WaveformToFbankConverter(
+                num_mel_bins=80,
+                waveform_scale=2**15,
+                channel_last=True,
+                standardize=True,
+                dtype=torch.float32,
+                device=device
+            )
+        return r
 
 
-    def compute_w2vbert_output(self, wavs):
+    def compute_w2vbert_output(self, wavs, wav_lens):
         fbanks = []
-        for wav in wavs:
+        wav_lens = wav_lens / wav_lens.max()
+        for i, wav in enumerate(wavs):
+            wav = wav[0: int(len(wav) * wav_lens[i])]
             decoded_audio = {'sample_rate': 16000.0, 
                             'format': 65538, 
                             'waveform': wav.unsqueeze(1)}
@@ -271,7 +287,7 @@ class SpeechClassificationModel(LightningModule):
                 if self.global_step == self.hparams.freeze_backbone_steps and self.global_step > 0:
                     logging.info("Starting backbone training")
 
-                reps = self.compute_w2vbert_output(wavs)
+                reps = self.compute_w2vbert_output(wavs, wav_lens)
             return reps.permute(0, 2, 1)
 
         else:
