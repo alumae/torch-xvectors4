@@ -85,6 +85,22 @@ class SpeechClassificationModel(LightningModule):
         #print("Model label2id:" , self.hparams.label2id)
         self.__build_model()
 
+    def to(self, device):
+        r = super().to(device)
+        #self.w2vbert2_fbank_converter.to(device)
+        #self.w2vbert2_model.to(device)
+        if self.hparams.w2vbert2_model != None:
+            #breakpoint()
+            self.w2vbert2_fbank_converter = WaveformToFbankConverter(
+                num_mel_bins=80,
+                waveform_scale=2**15,
+                channel_last=True,
+                standardize=True,
+                dtype=torch.float32,
+                device=device
+            )
+        return r
+
     def setup(self, stage: str):
         # build model
         
@@ -205,8 +221,8 @@ class SpeechClassificationModel(LightningModule):
 
         #print(self.model)
         #from torchsummary import summary
-        self.train_acc = Accuracy(task='multiclass', num_classes=len(self.hparams.label2id))
-        self.valid_acc = Accuracy(task='multiclass', num_classes=len(self.hparams.label2id))
+        self.train_acc = Accuracy(task='multiclass', num_classes=len(self.hparams.label2id), top_k=1)
+        self.valid_acc = Accuracy(task='multiclass', num_classes=len(self.hparams.label2id), top_k=1)
         
 
 
@@ -222,6 +238,7 @@ class SpeechClassificationModel(LightningModule):
         #breakpoint()
         src = self.w2vbert2_collater(fbanks)
         seqs, padding_mask = get_seqs_and_padding_mask(src)
+        #breakpoint()
         seqs, padding_mask = self.w2vbert2_model.encoder_frontend(seqs, padding_mask)
         seqs, padding_mask = self.w2vbert2_model.encoder(seqs, padding_mask)
         return seqs
@@ -265,14 +282,10 @@ class SpeechClassificationModel(LightningModule):
         if self.pre_pooling_layers:
             pre_pooling_output = self.pre_pooling_layers(pre_pooling_output)
         return self.pooling(pre_pooling_output).squeeze(2)
-
-    def extract_xvectors(self, wavs, wav_lens, layer_index=1):
-        pooling_output = self._forward_until_pooling(wavs, wav_lens)
-        #breakpoint()
-        return self.post_pooling_layers[0:layer_index](pooling_output)
         
 
     def extract_xvectors(self, wavs, wav_lens, layer_index=1):
+        #breakpoint()
         pooling_output = self._forward_until_pooling(wavs, wav_lens)
         #breakpoint()
         return self.post_pooling_layers[0:layer_index](pooling_output)

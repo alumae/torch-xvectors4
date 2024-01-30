@@ -48,7 +48,7 @@ if __name__ == '__main__':
                 if len(audio_batch) == args.batch_size:
                     # Convert list of tensors to a single tensor
                     audio_tensor = torch.nn.utils.rnn.pad_sequence(audio_batch, batch_first=True, padding_value=0.0).to(device)
-                    
+                    #breakpoint()
                     # Process the batch through the model
                     em_batch = model.extract_xvectors(audio_tensor, wav_lens=None).detach().cpu()
 
