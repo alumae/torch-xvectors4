@@ -28,6 +28,7 @@ if __name__ == '__main__':
     parser.add_argument("--segments", type=str)  
     parser.add_argument("--batch-size", default=256, type=int)  
     parser.add_argument("--device", default="cuda", type=str)  
+    parser.add_argument("--max-segment-length", type=float, default=0.0)      
     parser.add_argument("wav_scp")    
     parser.add_argument("out_dir")
     args = parser.parse_args()
@@ -48,6 +49,9 @@ if __name__ == '__main__':
             #for in tqdm(reader):
             audio = torch.FloatTensor(numpy_array)
             audio = audio / 2**15
+            if args.max_segment_length > 0.0:
+                max_in_samples = int(args.max_segment_length * 16000)
+                audio = audio[0:max_in_samples]            
             audio_batch.append(audio)
             keys_batch.append(key)
 
@@ -71,6 +75,8 @@ if __name__ == '__main__':
 
         # Handle the last batch
         if audio_batch:
+            wav_lens = torch.tensor([len(audio) for audio in audio_batch]).float()
+            wav_lens /= wav_lens.max()
             audio_tensor = torch.nn.utils.rnn.pad_sequence(audio_batch, batch_first=True, padding_value=0.0).to(device)
             em_batch = model.extract_xvectors(audio_tensor, wav_lens=wav_lens).detach().cpu()
             for i, key in enumerate(keys_batch):
