@@ -19,6 +19,8 @@ def load_simple_scp(wav_scp):
         audio_path = audio_path.strip()
         audio_path = audio_path.replace("wav-copy", "wav-copy --print-args=false")
         utt_sample_rate, sound_np = kaldiio.load_mat(audio_path)
+        if sound_np.dtype == np.int16:
+            sound_np = sound_np / float(2**15)
         yield uttid, (utt_sample_rate, sound_np)
 
 if __name__ == '__main__':
@@ -48,7 +50,6 @@ if __name__ == '__main__':
         for key, (rate, numpy_array)  in tqdm(kaldiio.load_scp_sequential(args.wav_scp, segments=args.segments)):
             #for in tqdm(reader):
             audio = torch.FloatTensor(numpy_array)
-            audio = audio / 2**15
             if args.max_segment_length > 0.0:
                 max_in_samples = int(args.max_segment_length * 16000)
                 audio = audio[0:max_in_samples]            
