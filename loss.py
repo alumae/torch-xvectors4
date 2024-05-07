@@ -598,3 +598,5 @@ class MammLossFunction(nn.Module):
     def get_posterior(self):
         assert self.posterior is not None
         return self.posterior
+
+

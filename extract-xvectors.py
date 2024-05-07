@@ -37,7 +37,7 @@ if __name__ == '__main__':
 
     device = torch.device(args.device)
 
-    model = SpeechClassificationModel.load_from_checkpoint(args.model).to(device)
+    model = SpeechClassificationModel.load_from_checkpoint(args.model, strict=False).to(device)
     model.eval()
 
     write_helper = kaldiio.WriteHelper(f'ark,scp:{args.out_dir}/xvector.ark,{args.out_dir}/xvector.scp')

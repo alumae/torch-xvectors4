@@ -25,6 +25,7 @@ from fairseq2.nn.padding import get_seqs_and_padding_mask
 from pathlib import Path
 from seamless_communication.models.conformer_shaw import load_conformer_shaw_model
 from fairseq2.data.data_pipeline import Collater
+from fairseq2.models.sequence import SequenceBatch
 from fairseq2.nn.lora import LoRAConfig
 from fairseq2.nn.lora import (
     freeze_non_lora,
@@ -37,6 +38,8 @@ from fairseq2.nn.lora import (
 from loss import SoftmaxLoss
 from pooling import *
 
+from utils import contrastive_cosine_loss, CCCLoss
+
 EPSILON = torch.tensor(torch.finfo(torch.float).eps)
 
 
@@ -47,6 +50,7 @@ class SpeechClassificationModel(LightningModule):
     def __init__(self, 
                  wav2vec2_model: str = None,
                  w2vbert2_model:str = None,
+                 sonar_speech_model:str = None,
                  pooling: str = "global-mha",
                  pooling_attention_hidden_dim: int = 64,
                  pre_pooling_hidden_dim: int = -1,
@@ -107,9 +111,15 @@ class SpeechClassificationModel(LightningModule):
 
         if self.hparams.load_pretrained_model is not None:
             logging.info(f"Loading pretrained model from {self.hparams.load_pretrained_model}")
-            checkpoint = torch.load(self.hparams.load_pretrained_model, map_location='cpu')
+            checkpoint = torch.load(self.hparams.load_pretrained_model, map_location='cpu')['state_dict']
             #SpeechClassificationModel._load_model_state(checkpoint)
-            self.load_state_dict(checkpoint['state_dict'])
+
+            current_model_dict = self.state_dict()
+            
+            new_state_dict={k:v if v.size()==current_model_dict[k].size()  else  current_model_dict[k] for k,v in zip(current_model_dict.keys(), checkpoint.values())}
+            self.load_state_dict(new_state_dict, strict=False)
+
+            #self.load_state_dict(checkpoint, strict=False)
             # state_dict = checkpoint["state_dict"]
             # model_state_dict = self.state_dict()
             # is_changed = False
@@ -148,7 +158,7 @@ class SpeechClassificationModel(LightningModule):
             wavs = torch.randn((1,16000), dtype=torch.float)
             reps = self.wav2vec2(wavs)            
             self.encoder_output_dim = reps.shape[2]
-        elif self.hparams.w2vbert2_model != None:
+        elif self.hparams.w2vbert2_model != None or self.hparams.sonar_speech_model != None:
             #breakpoint()
             self.w2vbert2_fbank_converter = WaveformToFbankConverter(
                 num_mel_bins=80,
@@ -159,52 +169,68 @@ class SpeechClassificationModel(LightningModule):
                 device=self.device
             )
             self.w2vbert2_collater = Collater(pad_value=1)
-            self.w2vbert2_model  = load_conformer_shaw_model("conformer_shaw", device=self.device, dtype=torch.float32)
+            if self.hparams.w2vbert2_model != None:
+                self.w2vbert2_model  = load_conformer_shaw_model("conformer_shaw", device=self.device, dtype=torch.float32)
 
-            lora_config = LoRAConfig(
-                r=32,
-                alpha=32.0,
-                dropout_p=0.05,
-                keys=[".*.self_attn.*(q_proj|v_proj)$"])
-            self.w2vbert2_model = wrap_lora(self.w2vbert2_model, lora_config)
-            freeze_non_lora(self.w2vbert2_model, unfreeze_bias="none")
+                lora_config = LoRAConfig(
+                    r=32,
+                    alpha=32.0,
+                    dropout_p=0.05,
+                    keys=[".*.self_attn.*(q_proj|v_proj)$"])
+                self.w2vbert2_model = wrap_lora(self.w2vbert2_model, lora_config)
+                freeze_non_lora(self.w2vbert2_model, unfreeze_bias="none")
 
-            wavs = torch.randn((1,16000), dtype=torch.float)
-            reps = self.compute_w2vbert_output(wavs, wav_lens=torch.tensor([1.0]))
-            self.encoder_output_dim = reps.shape[2]
+                wavs = torch.randn((1,16000), dtype=torch.float)
+                reps = self.compute_w2vbert_output(wavs, wav_lens=torch.tensor([1.0]))
+                self.encoder_output_dim = reps.shape[2]
+            if self.hparams.sonar_speech_model != None:
+                from sonar.models.sonar_speech.loader import load_sonar_speech_model
+                self.sonar_speech_model = load_sonar_speech_model(self.hparams.sonar_speech_model, device=self.device)
+                lora_config = LoRAConfig(
+                    r=32,
+                    alpha=32.0,
+                    dropout_p=0.05,
+                    keys=[".*.self_attn.*(q_proj|v_proj)$"])
+                self.sonar_speech_model = wrap_lora(self.sonar_speech_model, lora_config)
+                freeze_non_lora(self.sonar_speech_model, unfreeze_bias="none")
+
+                pooling_output_dim = self.sonar_speech_model.model_dim
+
 
         else:
             raise Exception("Unknown model backbone")    
 
-           
-        pooling_map = {"stats": StatisticsPooling, 
-                       "attentive-stats": AttentiveStatisticsPooling,
-                       "lde" : LDEPooling, 
-                       "mha": MultiHeadAttentionPooling, 
-                       "global-mha": GlobalMultiHeadAttentionPooling,
-                       "multires-mha": MultiResolutionMultiHeadAttentionPooling,
-                       "ecapa-attentive-stats": EcapaAttentiveStatisticsPooling}
+        if self.hparams.sonar_speech_model == None:           
+            pooling_map = {"stats": StatisticsPooling, 
+                        "attentive-stats": AttentiveStatisticsPooling,
+                        "lde" : LDEPooling, 
+                        "mha": MultiHeadAttentionPooling, 
+                        "global-mha": GlobalMultiHeadAttentionPooling,
+                        "multires-mha": MultiResolutionMultiHeadAttentionPooling,
+                        "ecapa-attentive-stats": EcapaAttentiveStatisticsPooling}
+            
+
+
+            pooling_input_dim = self.encoder_output_dim
+            if self.hparams.pre_pooling_hidden_dim != -1:
+                pre_pooling_layers = []
+                pre_pooling_layers.append(nn.Conv1d(self.encoder_output_dim, self.hparams.pre_pooling_hidden_dim, kernel_size=self.hparams.pre_pooling_kernel_size, stride=self.hparams.pre_pooling_stride))
+                pre_pooling_layers.append(nn.BatchNorm1d(self.hparams.pre_pooling_hidden_dim))
+                pre_pooling_layers.append(nn.ReLU(inplace=True))
+                self.pre_pooling_layers = nn.Sequential(*pre_pooling_layers)
+                pooling_input_dim = self.hparams.pre_pooling_hidden_dim
+            else:
+                self.pre_pooling_layers = None
+
+
+            self.pooling = pooling_map[self.hparams.pooling](input_dim=pooling_input_dim, hidden_size=self.hparams.pooling_attention_hidden_dim)
+            pooling_output_dim = self.pooling.get_output_dim()
         
-
-
-        pooling_input_dim = self.encoder_output_dim
-        if self.hparams.pre_pooling_hidden_dim != -1:
-            pre_pooling_layers = []
-            pre_pooling_layers.append(nn.Conv1d(self.encoder_output_dim, self.hparams.pre_pooling_hidden_dim, kernel_size=self.hparams.pre_pooling_kernel_size, stride=self.hparams.pre_pooling_stride))
-            pre_pooling_layers.append(nn.BatchNorm1d(self.hparams.pre_pooling_hidden_dim))
-            pre_pooling_layers.append(nn.ReLU(inplace=True))
-            self.pre_pooling_layers = nn.Sequential(*pre_pooling_layers)
-            pooling_input_dim = self.hparams.pre_pooling_hidden_dim
-        else:
-            self.pre_pooling_layers = None
-
-
-        self.pooling = pooling_map[self.hparams.pooling](input_dim=pooling_input_dim, hidden_size=self.hparams.pooling_attention_hidden_dim)
 
         
         post_pooling_layers = []
 
-        post_pooling_layers.append(nn.Linear(self.pooling.get_output_dim(), self.hparams.hidden_dim))
+        post_pooling_layers.append(nn.Linear(pooling_output_dim, self.hparams.hidden_dim))
         post_pooling_layers.append(nn.BatchNorm1d(self.hparams.hidden_dim))
         post_pooling_layers.append(nn.ReLU(inplace=True))
 
@@ -213,11 +239,11 @@ class SpeechClassificationModel(LightningModule):
         post_pooling_layers.append(nn.ReLU(inplace=True))
         self.post_pooling_layers = nn.Sequential(*post_pooling_layers)
 
-
         self.loss = SoftmaxLoss(input_dim=self.hparams.hidden_dim, 
                                         num_targets=len(self.hparams.label2id),
                                         entropy_regularization=self.hparams.entropy_regularization)
             
+        self.ccc_loss = CCCLoss(input_dim=self.hparams.hidden_dim, output_dim=3) # FIXME 3
 
         #print(self.model)
         #from torchsummary import summary
@@ -228,7 +254,7 @@ class SpeechClassificationModel(LightningModule):
 
     def to(self, device):
         r = super().to(device)
-        if self.hparams.w2vbert2_model != None:
+        if self.hparams.w2vbert2_model != None or self.hparams.sonar_speech_model != None:
             self.w2vbert2_fbank_converter = WaveformToFbankConverter(
                 num_mel_bins=80,
                 waveform_scale=2**15,
@@ -239,8 +265,20 @@ class SpeechClassificationModel(LightningModule):
             )
         return r
 
+    def compute_sonar_output(self, wavs, wav_lens):
+        seqs, padding_mask = self.compute_w2vbert_fbanks(wavs, wav_lens)
+        sb =  SequenceBatch(seqs, padding_mask)
+        r = self.sonar_speech_model(sb)
+        return r.sentence_embeddings
 
     def compute_w2vbert_output(self, wavs, wav_lens):
+        seqs, padding_mask = self.compute_w2vbert_fbanks(wavs, wav_lens)
+        #breakpoint()
+        seqs, padding_mask = self.w2vbert2_model.encoder_frontend(seqs, padding_mask)
+        seqs, padding_mask = self.w2vbert2_model.encoder(seqs, padding_mask)
+        return seqs
+
+    def compute_w2vbert_fbanks(self, wavs, wav_lens):
         fbanks = []
         wav_lens = wav_lens / wav_lens.max()
         for i, wav in enumerate(wavs):
@@ -254,18 +292,22 @@ class SpeechClassificationModel(LightningModule):
         #breakpoint()
         src = self.w2vbert2_collater(fbanks)
         seqs, padding_mask = get_seqs_and_padding_mask(src)
-        #breakpoint()
-        seqs, padding_mask = self.w2vbert2_model.encoder_frontend(seqs, padding_mask)
-        seqs, padding_mask = self.w2vbert2_model.encoder(seqs, padding_mask)
-        return seqs
+        return seqs,padding_mask
 
     # ---------------------
     # TRAINING
     # ---------------------
+    def compute_xvectors_and_output(self, wavs, wav_lens):
+        #pooling_output = self._forward_until_pooling(wavs, wav_lens)
+        #post_pooling_output = self.post_pooling_layers(pooling_output)
+
+        #return post_pooling_output
+        xvectors = self.extract_xvectors(wavs, wav_lens, layer_index=1)
+        output = self.post_pooling_layers[1:](xvectors)
+        return xvectors, output
+
     def forward(self, wavs, wav_lens):
-        pooling_output = self._forward_until_pooling(wavs, wav_lens)
-        post_pooling_output = self.post_pooling_layers(pooling_output)
-        return post_pooling_output
+        return self.compute_xvectors_and_output(wavs, wav_lens)[1]
 
     def _forward_until_before_pooling(self, wavs, wav_lens):
         if self.wav2vec2 is not None:     
@@ -294,10 +336,13 @@ class SpeechClassificationModel(LightningModule):
             raise Exception("not implemented")
 
     def _forward_until_pooling(self, wavs, wav_lens):
-        pre_pooling_output = self._forward_until_before_pooling(wavs, wav_lens)
-        if self.pre_pooling_layers:
-            pre_pooling_output = self.pre_pooling_layers(pre_pooling_output)
-        return self.pooling(pre_pooling_output).squeeze(2)
+        if self.hparams.sonar_speech_model != None:
+            return self.compute_sonar_output(wavs, wav_lens)
+        else:
+            pre_pooling_output = self._forward_until_before_pooling(wavs, wav_lens)
+            if self.pre_pooling_layers:
+                pre_pooling_output = self.pre_pooling_layers(pre_pooling_output)
+            return self.pooling(pre_pooling_output).squeeze(2)
         
 
     def extract_xvectors(self, wavs, wav_lens, layer_index=1):
@@ -346,6 +391,8 @@ class SpeechClassificationModel(LightningModule):
         return [optimizer], [scheduler]
 
 
+        
+
     def training_step(self, batch, batch_idx):
         """
         Lightning calls this inside the training loop
@@ -357,22 +404,48 @@ class SpeechClassificationModel(LightningModule):
         #logging.info(indexes)
         wav = batch["wav"]
         dur = batch["dur"]
-        y = batch["label_id"]
         #y_hat = self.forward(wav, dur)
-        y_hat = self.forward(wav, dur)
-
-        loss_vector = self.loss(y_hat.unsqueeze(2), y)
-        pred_vector = self.loss.get_posterior().squeeze(2).argmax(dim=1)
-
-        loss_val = loss_vector.mean()
-
-    
-        lr  = torch.tensor(self.trainer.optimizers[0].param_groups[-1]['lr'], device=loss_val.device)
-        self.log('train_loss', loss_val, prog_bar=True, sync_dist=True)
-        self.log('lr', lr, prog_bar=True, rank_zero_only=True)
-        self.log("train_acc", self.train_acc(pred_vector.cpu(), y.int().cpu()), prog_bar=True, sync_dist=True)
         
-        return loss_val
+        lr  = torch.tensor(self.trainer.optimizers[0].param_groups[-1]['lr'], device=wav.device)
+        self.log('lr', lr, prog_bar=True, rank_zero_only=True)
+        y = batch["label_id"]
+
+        if batch["type"] == "classification":
+            y_hat = self.forward(wav, dur)
+
+            loss_vector = self.loss(y_hat.unsqueeze(2), y)
+            pred_vector = self.loss.get_posterior().squeeze(2).argmax(dim=1)
+
+            loss_val = loss_vector.mean()
+        
+            self.log('train_loss', loss_val, prog_bar=True, sync_dist=True)
+            self.log("train_acc", self.train_acc(pred_vector.cpu(), y.int().cpu()), prog_bar=True, sync_dist=True)
+            
+            return loss_val
+        elif batch["type"] == "contrastive":
+            xvectors = self.extract_xvectors(wav, dur)            
+            loss_val = 0
+            for i in range(len(xvectors) // 3):
+                #assert y[i*3] == y[i*3+1]
+                #assert y[i*3] != y[i*3+1]
+                loss_val += contrastive_cosine_loss(xvectors[i*3], xvectors[i*3+1], 1)
+                loss_val += contrastive_cosine_loss(xvectors[i*3], xvectors[i*3+2], 0)
+
+            loss_val = loss_val / (len(xvectors) // 3) / 2
+            self.log('train_loss', loss_val, prog_bar=True, sync_dist=True)
+            return loss_val
+        elif batch["type"] == "ccc":
+            y_hat =  self.forward(wav, dur)
+            loss_val = self.ccc_loss(y_hat, batch["attributes"])
+            self.log('train_ccc_loss', loss_val, prog_bar=True, sync_dist=True)
+            return loss_val
+
+        else:
+            raise Exception("Unknown batch type")
+
+
+
+
 
 
 
@@ -385,17 +458,35 @@ class SpeechClassificationModel(LightningModule):
         # Normal validation
         wav = batch["wav"]
         dur = batch["dur"]
-        y = batch["label_id"]
-        y_hat = self.forward(wav, dur)
-        loss_vector = self.loss(y_hat.unsqueeze(2), y)
-        pred_vector = self.loss.get_posterior().squeeze(2).argmax(dim=1)
+        if batch["type"] == "classification":
 
-        loss_val = loss_vector.mean()
+            y = batch["label_id"]
+            y_hat = self.forward(wav, dur)
+            loss_vector = self.loss(y_hat.unsqueeze(2), y)
+            pred_vector = self.loss.get_posterior().squeeze(2).argmax(dim=1)
 
-        #breakpoint()
-        # acc        
-        self.log("val_acc", self.valid_acc(pred_vector.cpu(), y.int().cpu()), prog_bar=True, sync_dist=True)
-        self.log('val_loss', loss_val, prog_bar=True, sync_dist=True)
+            loss_val = loss_vector.mean()
+            self.log("val_acc", self.valid_acc(pred_vector.cpu(), y.int().cpu()), prog_bar=True, sync_dist=True)
+            self.log('val_loss', loss_val, prog_bar=True, sync_dist=True)
+        elif batch["type"] == "contrastive":
+            xvectors = self.extract_xvectors(wav, dur)            
+            loss_val = 0
+            for i in range(len(xvectors) // 3):
+                loss_val += contrastive_cosine_loss(xvectors[i*3], xvectors[i*3+1], 1)
+                loss_val += contrastive_cosine_loss(xvectors[i*3], xvectors[i*3+2], 0)
+
+            loss_val = loss_val / (len(xvectors) // 3) / 2
+            self.log('val_loss', loss_val, prog_bar=True, sync_dist=True)
+        elif batch["type"] == "ccc":
+            y_hat =  self.forward(wav, dur)
+            loss_val = self.ccc_loss(y_hat, batch["attributes"])
+            self.log('val_ccc_loss', loss_val, prog_bar=True, sync_dist=True)
+            return loss_val
+
+        else:
+            raise Exception("Unknown batch type")
+
+
 
 
     def test_step(self, batch, batch_idx):        
@@ -448,15 +539,23 @@ class SpeechClassificationModel(LightningModule):
         wav = batch["wav"]
         dur = batch["dur"]
         utt_ids = batch["utt_id"]
+        if batch["type"] == "classification":
+            xvectors, outputs = self.compute_xvectors_and_output(wav, dur)
+            probs = F.softmax(self.loss.affine(outputs), dim=1)
+            output = {}
+            for i, utt_id in enumerate(utt_ids):
+                output[utt_id] = (xvectors[i],  probs[i])
 
-        xvectors = self.extract_xvectors(wav, dur)
+            return output
+        elif batch["type"] == "ccc":
+            y_hat =  self.forward(wav, dur)
+            predictions = self.ccc_loss.get_predictions(y_hat)
+            #breakpoint()
+            output = {}
+            for i, utt_id in enumerate(utt_ids):
+                output[utt_id] = predictions[i]
 
-        output = {}
-        for i, utt_id in enumerate(utt_ids):
-            output[utt_id] = xvectors[i]
-
-        return output
-
+            return output                     
 
     # @staticmethod
     # def add_model_specific_args(parent_parser, root_dir):  # pragma: no cover

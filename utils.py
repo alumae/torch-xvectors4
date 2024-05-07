@@ -2,7 +2,7 @@ import numpy as np
 
 import torch
 import torch.nn.functional as F
-
+import torch.nn as nn
 
 def to_device(device_object, tensor):
     """
@@ -200,3 +200,153 @@ def mixup_data(x, y, alpha=1.0, use_cuda=True):
 
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+def contrastive_cosine_loss(output1, output2, label, margin=0):
+    # Cosine similarity
+    #breakpoint()
+    cosine_similarity = F.cosine_similarity(output1.unsqueeze(0), output2.unsqueeze(0))
+    # For similar pairs, loss is (1-cosine_similarity)
+    # For dissimilar pairs, loss is max(0, cosine_similarity - margin)
+    if label == 1:
+        loss = (1 - cosine_similarity)
+    else:
+        loss = torch.clamp(cosine_similarity - margin, min=0.0)
+    
+    return loss
+
+    import torch
+
+
+
+def concordance_correlation_coefficient_batched(x, y):
+    # Ensure x and y are of the same shape
+    assert x.shape == y.shape, "Input matrices must have the same shape"
+
+    # Initialize CCC list
+    ccc_list = []
+    
+    # Iterate over columns
+    for i in range(x.shape[1]):
+        col_x = x[:, i]
+        col_y = y[:, i]
+
+        # Calculate means
+        mean_x = torch.mean(col_x)
+        mean_y = torch.mean(col_y)
+
+        # Calculate variances
+        var_x = torch.var(col_x, unbiased=False)
+        var_y = torch.var(col_y, unbiased=False)
+
+        # Calculate covariance
+        covariance = torch.mean((col_x - mean_x) * (col_y - mean_y))
+
+        # Compute CCC for the current column
+        ccc = (2 * covariance) / (var_x + var_y + (mean_x - mean_y) ** 2)
+        ccc_list.append(ccc)
+
+    # Calculate mean CCC over all columns
+    mean_ccc = torch.mean(torch.tensor(ccc_list))
+    return mean_ccc
+
+
+class CCCLoss(nn.Module):
+    def __init__(self, input_dim, output_dim, likert_scale=7):
+        """
+        Initializes the CCC loss module.
+        
+        :param input_dim: Dimensionality of the input features.
+        :param hidden_dim: Dimensionality of the hidden layer.
+        :param output_dim: Dimensionality of the output features (K).
+        """
+        super(CCCLoss, self).__init__()
+        #self.hidden_layer = nn.Linear(input_dim, input_dim)
+        self.output_layer = nn.Linear(input_dim, output_dim)
+        
+        self.output_layer.bias.data.fill_(0.0)
+        self.tanh = nn.Tanh()
+
+    def get_predictions(self, x):
+        # Process input through the hidden layer and the output layer
+        #return self.output_layer(self.tanh(self.hidden_layer(x)))
+        return self.output_layer(self.tanh((x)))
+
+    def forward(self, x, y):
+        """
+        Forward pass to compute the CCC loss.
+        
+        :param x: Input tensor from the neural network (batch_size, input_dim).
+        :param y: Target tensor (batch_size, output_dim).
+        :return: Mean CCC loss.
+        """
+        x = self.get_predictions(x)
+
+        
+        # Ensure x and y are of the same shape
+        assert x.shape == y.shape, "Shape of predicted and target tensors must match"
+        
+        # Compute CCC for each column and then the mean CCC over all columns
+        mean_x = torch.mean(x, dim=0)
+        mean_y = torch.mean(y, dim=0)
+        var_x = torch.var(x, dim=0, unbiased=False)
+        var_y = torch.var(y, dim=0, unbiased=False)
+        covariance = torch.mean((x - mean_x) * (y - mean_y), dim=0)
+        ccc = (2 * covariance) / (var_x + var_y + (mean_x - mean_y) ** 2)
+        mean_ccc = torch.mean(ccc)
+        
+        # Since CCC indicates agreement, to use it as a loss we subtract from 1
+        return 1 - mean_ccc
+    
+# class CCCLoss(nn.Module):
+#     def __init__(self, input_dim, output_dim, likert_scale=7):
+#         """
+#         Initializes the CCC loss module.
+        
+#         :param input_dim: Dimensionality of the input features.
+#         :param hidden_dim: Dimensionality of the hidden layer.
+#         :param output_dim: Dimensionality of the output features (K).
+#         """
+#         super(CCCLoss, self).__init__()
+#         self.hidden_layer = nn.Linear(input_dim, input_dim)
+#         self.output_layer = nn.Linear(input_dim, output_dim)
+        
+#         self.output_layer.bias.data.fill_(0.0)
+#         self.likert_scale = likert_scale
+#         #self.tanh = nn.Tanh()
+
+#     def get_predictions(self, x):
+#         # Process input through the hidden layer and the output layer
+#         #return self.output_layer(self.tanh(self.hidden_layer(x)))
+#         #return self.output_layer(self.tanh((x)))
+#         x = torch.relu(self.hidden_layer(x))
+#         x = torch.sigmoid(self.output_layer(x))
+#         return x * (self.likert_scale - 1) + 1  # Scale output to 1-scale range
+
+#     def forward(self, x, y):
+#         """
+#         Forward pass to compute the CCC loss.
+        
+#         :param x: Input tensor from the neural network (batch_size, input_dim).
+#         :param y: Target tensor (batch_size, output_dim).
+#         :return: Mean CCC loss.
+#         """
+#         x = self.get_predictions(x)
+
+        
+#         # Ensure x and y are of the same shape
+#         assert x.shape == y.shape, "Shape of predicted and target tensors must match"
+        
+#         # Compute CCC for each column and then the mean CCC over all columns
+#         mean_x = torch.mean(x, dim=0)
+#         mean_y = torch.mean(y, dim=0)
+#         var_x = torch.var(x, dim=0, unbiased=False)
+#         var_y = torch.var(y, dim=0, unbiased=False)
+#         covariance = torch.mean((x - mean_x) * (y - mean_y), dim=0)
+#         ccc = (2 * covariance) / (var_x + var_y + (mean_x - mean_y) ** 2)
+#         mean_ccc = torch.mean(ccc)
+        
+#         # Since CCC indicates agreement, to use it as a loss we subtract from 1
+#         return 1 - mean_ccc
+
+

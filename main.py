@@ -50,9 +50,34 @@ class MyLightningCLI(LightningCLI):
     #     self._add_configure_optimizers_method_to_model(self.subcommand)
     #     self.trainer = self.instantiate_trainer()
 
+class XVectorPredsWriter(BasePredictionWriter):
+
+    def __init__(self, output_dir, basename="xvector", write_interval="epoch"):
+        super().__init__(write_interval)
+        self.output_dir = output_dir
+
+    def write_on_epoch_end(self, trainer, pl_module, predictions, batch_indices):
+        # this will create N (num processes) files in `output_dir` each containing
+        # the predictions of it's respective rank
+        
+        #torch.save(predictions, os.path.join(self.output_dir, f"predictions_{trainer.global_rank}.pt"))
+        from kaldiio import WriteHelper
+        write_helper = WriteHelper(f'ark,scp:{self.output_dir}/xvector.{trainer.global_rank+1}.ark,{self.output_dir}/xvector.{trainer.global_rank+1}.scp')
+        for batch_predictions in predictions:
+            for utt_id, (xvector, probs) in batch_predictions.items():
+                write_helper(utt_id, xvector.cpu().numpy().flatten())
+        
+        write_helper = WriteHelper(f'ark,scp:{self.output_dir}/probs.{trainer.global_rank+1}.ark,{self.output_dir}/probs.{trainer.global_rank+1}.scp')
+        for batch_predictions in predictions:
+            for utt_id, (xvector, probs) in batch_predictions.items():
+                write_helper(utt_id, probs.cpu().numpy().flatten())
+                
+        write_helper.close()
+
+
 class XVectorWriter(BasePredictionWriter):
 
-    def __init__(self, output_dir, write_interval="epoch"):
+    def __init__(self, output_dir, basename="xvector", write_interval="epoch"):
         super().__init__(write_interval)
         self.output_dir = output_dir
 
@@ -66,8 +91,9 @@ class XVectorWriter(BasePredictionWriter):
         for batch_predictions in predictions:
             for utt_id, xvector in batch_predictions.items():
                 write_helper(utt_id, xvector.cpu().numpy().flatten())
+        
+                
         write_helper.close()
-
 
 
 
